@@ -1,32 +1,45 @@
-//  Intel Edison Playground
-//  Copyright (c) 2015 Damian Kołakowski. All rights reserved.
+// BLE Sensor scanner, based on code from
+// Intel Edison Playground / Copyright (c) 2015 Damian Kołakowski. All rights reserved.
 
 #include <bluetooth/bluetooth.h>
 #include <bluetooth/hci.h>
 #include <bluetooth/hci_lib.h>
 #include <curses.h>
 #include <errno.h>
+#include <gflags/gflags.h>
 #include <stdlib.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
-struct hci_request ble_hci_request(uint16_t ocf, int clen, void *status,
-                                   void *cparam) {
-  struct hci_request rq;
-  memset(&rq, 0, sizeof(rq));
+DEFINE_double(report_interval_s, 30.0,
+              "Per-device interval between measurement reports.");
+
+namespace {
+
+// Executes an HCI request successfully or exits.
+void ExecHciRequestOrDie(uint16_t ocf, int clen, void *cparam, const int device,
+                         const char *error) {
+  int status;
+  hci_request rq{};
   rq.ogf = OGF_LE_CTL;
   rq.ocf = ocf;
   rq.cparam = cparam;
   rq.clen = clen;
-  rq.rparam = status;
+  rq.rparam = &status;
   rq.rlen = 1;
-  return rq;
+  if (hci_send_req(device, &rq, 1000) < 0) {
+    hci_close_dev(device);
+    perror(error);
+  }
 }
+
+} // namespace
 
 short read_short(unsigned char *buf) { return *buf + (*(buf + 1) << 8); }
 
-int main() {
+int main(int argc, char *argv[]) {
+  gflags::ParseCommandLineFlags(&argc, &argv, /*remove_flags=*/false);
   int ret, status;
 
   // Get HCI device.
@@ -38,62 +51,30 @@ int main() {
   }
 
   // Set BLE scan parameters.
-  le_set_scan_parameters_cp scan_params_cp;
-  memset(&scan_params_cp, 0, sizeof(scan_params_cp));
+  le_set_scan_parameters_cp scan_params_cp{};
   scan_params_cp.type = 0x00;
   scan_params_cp.interval = htobs(0x0010);
   scan_params_cp.window = htobs(0x0010);
   scan_params_cp.own_bdaddr_type = 0x00; // Public Device Address (default).
   scan_params_cp.filter = 0x00;          // Accept all.
-
-  struct hci_request scan_params_rq =
-      ble_hci_request(OCF_LE_SET_SCAN_PARAMETERS,
-                      LE_SET_SCAN_PARAMETERS_CP_SIZE, &status, &scan_params_cp);
-
-  ret = hci_send_req(device, &scan_params_rq, 1000);
-  if (ret < 0) {
-    hci_close_dev(device);
-    perror("Failed to set scan parameters data.");
-    return 0;
-  }
+  ExecHciRequestOrDie(OCF_LE_SET_SCAN_PARAMETERS,
+                      LE_SET_SCAN_PARAMETERS_CP_SIZE, &scan_params_cp, device,
+                      "Failed to set scan parameters data.");
 
   // Set BLE events report mask.
-
-  le_set_event_mask_cp event_mask_cp;
-  memset(&event_mask_cp, 0, sizeof(le_set_event_mask_cp));
-  int i = 0;
-  for (i = 0; i < 8; i++)
-    event_mask_cp.mask[i] = 0xFF;
-
-  struct hci_request set_mask_rq =
-      ble_hci_request(OCF_LE_SET_EVENT_MASK, LE_SET_EVENT_MASK_CP_SIZE, &status,
-                      &event_mask_cp);
-  ret = hci_send_req(device, &set_mask_rq, 1000);
-  if (ret < 0) {
-    hci_close_dev(device);
-    perror("Failed to set event mask.");
-    return 0;
-  }
+  le_set_event_mask_cp event_mask_cp{};
+  memset(event_mask_cp.mask, 0xff, 8); // All events
+  ExecHciRequestOrDie(OCF_LE_SET_EVENT_MASK, LE_SET_EVENT_MASK_CP_SIZE,
+                      &event_mask_cp, device, "Failed to set event mask.");
 
   // Enable scanning.
-
-  le_set_scan_enable_cp scan_cp;
-  memset(&scan_cp, 0, sizeof(scan_cp));
+  le_set_scan_enable_cp scan_cp{};
   scan_cp.enable = 0x01;     // Enable flag.
   scan_cp.filter_dup = 0x00; // Filtering disabled.
-
-  struct hci_request enable_adv_rq = ble_hci_request(
-      OCF_LE_SET_SCAN_ENABLE, LE_SET_SCAN_ENABLE_CP_SIZE, &status, &scan_cp);
-
-  ret = hci_send_req(device, &enable_adv_rq, 1000);
-  if (ret < 0) {
-    hci_close_dev(device);
-    perror("Failed to enable scan.");
-    return 0;
-  }
+  ExecHciRequestOrDie(OCF_LE_SET_SCAN_ENABLE, LE_SET_SCAN_ENABLE_CP_SIZE,
+                      &scan_cp, device, "Failed to enable scan.");
 
   // Get Results.
-
   struct hci_filter nf;
   hci_filter_clear(&nf);
   hci_filter_set_ptype(HCI_EVENT_PKT, &nf);
@@ -104,7 +85,7 @@ int main() {
     return 0;
   }
 
-  printf("Scanning....\n");
+  printf("Scanning (report interval=%.1fs)...\n", FLAGS_report_interval_s);
 
   uint8_t buf[HCI_MAX_EVENT_SIZE];
   evt_le_meta_event *meta_event;
@@ -143,18 +124,10 @@ int main() {
   }
 
   // Disable scanning.
-
-  memset(&scan_cp, 0, sizeof(scan_cp));
-  scan_cp.enable = 0x00; // Disable flag.
-
-  struct hci_request disable_adv_rq = ble_hci_request(
-      OCF_LE_SET_SCAN_ENABLE, LE_SET_SCAN_ENABLE_CP_SIZE, &status, &scan_cp);
-  ret = hci_send_req(device, &disable_adv_rq, 1000);
-  if (ret < 0) {
-    hci_close_dev(device);
-    perror("Failed to disable scan.");
-    return 0;
-  }
+  le_set_scan_enable_cp end_scan_cp{};
+  end_scan_cp.enable = 0x00; // Disable flag.
+  ExecHciRequestOrDie(OCF_LE_SET_SCAN_ENABLE, LE_SET_SCAN_ENABLE_CP_SIZE,
+                      &end_scan_cp, device, "Failed to disable scan.");
 
   hci_close_dev(device);
 
