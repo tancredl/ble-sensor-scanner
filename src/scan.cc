@@ -10,16 +10,19 @@
 #include <bluetooth/hci.h>
 #include <bluetooth/hci_lib.h>
 #include <curses.h>
+#include <endian.h>
 #include <errno.h>
 #include <gflags/gflags.h>
 #include <signal.h>
 #include <stdlib.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 DEFINE_double(report_interval_s, 30.0,
               "Per-device interval between measurement reports.");
+DEFINE_int32(app_id, 0xFEED, "Application id in sensor advertisement packets.");
 DEFINE_int32(
     device_id, -1,
     "Bluetooth adapter id (0 being the first). Use -1 for first available.");
@@ -34,42 +37,60 @@ bool operator<(const bdaddr_t a, const bdaddr_t b) {
 
 namespace {
 
+double now() {
+  timeval time;
+  gettimeofday(&time, NULL); // get current time
+  return time.tv_sec + 1e-6 * time.tv_usec;
+}
+
 // Readings from a sensor.
 class SensorReadings {
 public:
-  void AddReading(const le_advertising_info &info, const uint8_t *data) {
+  // Adds a reading if it is from a targeted sensor.
+  void AddReadingIfSensor(const le_advertising_info &info,
+                          const uint8_t *data) {
+    if (le16toh(*reinterpret_cast<const unsigned short *>(data + 9)) !=
+        FLAGS_app_id) {
+      return; // Not from our sensor.
+    }
     readings.push_back(std::pair<le_advertising_info, Bytes>(
         info, Bytes(data, data + info.length + 1)));
   }
 
   void PrintAndFlush() {
-    for (const std::pair<le_advertising_info, Bytes> &info_and_data :
-         readings) {
-      const le_advertising_info &info = info_and_data.first;
-      const Bytes &data = info_and_data.second;
-
-      char addr[18]{};
-      ba2str(&(info.bdaddr), addr);
-      printf("%s - RSSI %4d ", addr, (char)data[info.length]);
-      for (const auto &byte : data) {
-        printf("%02X", byte);
-      }
-      float voltage = 0.0;
-      if (info.length > 15) {
-        voltage = read_short(data, 15) / 1000.0;
-      }
-      printf(" T=%3.2f C H=%3.2f %% Vdd=%1.3f V",
-             ((float)read_short(data, 11)) / 256.0,
-             ((float)read_short(data, 13)) / 256.0, voltage);
-      printf("\n");
+    if (readings.empty()) {
+      // Nothing to print.
+      return;
     }
-    readings.clear();
+    // Emit the last seen value.
+    double print_time = now();
+    const std::pair<le_advertising_info, Bytes> &info_and_data =
+        readings.back();
+    const le_advertising_info &info = info_and_data.first;
+    const Bytes &data = info_and_data.second;
+
+    char addr[6 * 3 + 1]{};
+    ba2str(&(info.bdaddr), addr);
+    printf("%010.3lf %s n= %2ld RSSI(dB)= %3d ", print_time, addr,
+           readings.size(), (char)data[info.length]);
+    float voltage = -1.0;
+    if (info.length > 15) {
+      voltage = read_value(data, 15, 1000.0);
+    }
+    printf("T(C)= %3.2f H(%%)= %3.2f Vdd(V)= %1.3f\n",
+           read_value(data, 11, 256.0), read_value(data, 13, 256.0), voltage);
     fflush(stdout);
+
+    readings.clear();
+    mute_until = print_time + FLAGS_report_interval_s;
   }
 
+  bool IsMuted() { return mute_until > now(); }
+
 private:
-  short read_short(const Bytes &data, int offset) {
-    return data[offset] + (data[offset + 1] << 8);
+  float read_value(const Bytes &data, int offset, float steps_per_unit) {
+    return le16toh(*reinterpret_cast<const unsigned short *>(&data[offset])) /
+           steps_per_unit;
   }
 
   // Readings as pairs of advertising info and user bytes.
@@ -154,7 +175,7 @@ public:
         uint8_t *offset = meta_event->data + 1;
         while (reports_count--) {
           le_advertising_info &info = *((le_advertising_info *)offset);
-          readings[info.bdaddr].AddReading(info, info.data);
+          readings[info.bdaddr].AddReadingIfSensor(info, info.data);
           offset += EVT_LE_META_EVENT_SIZE + LE_ADVERTISING_INFO_SIZE +
                     info.length +
                     1 /* final RSSI byte in EVT_LE_ADVERTISING_REPORT */;
@@ -166,7 +187,9 @@ public:
   // Prints all received readings and flushes the printed readings.
   void PrintAndFlushReadings() {
     for (std::pair<const bdaddr_t, SensorReadings> &keyed_reading : readings) {
-      keyed_reading.second.PrintAndFlush();
+      if (!keyed_reading.second.IsMuted()) {
+        keyed_reading.second.PrintAndFlush();
+      }
     }
   }
 
