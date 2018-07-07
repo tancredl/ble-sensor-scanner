@@ -27,6 +27,11 @@ DEFINE_int32(
 using std::string;
 using Bytes = std::vector<uint8_t>;
 
+// Needed for map of bt addresses.
+bool operator<(const bdaddr_t a, const bdaddr_t b) {
+  return memcmp(&a, &b, sizeof(bdaddr_t)) < 0;
+}
+
 namespace {
 
 // Readings from a sensor.
@@ -37,13 +42,15 @@ public:
         info, Bytes(data, data + info.length + 1)));
   }
 
-  void PrintAndFlush(const string &bt_address) {
+  void PrintAndFlush() {
     for (const std::pair<le_advertising_info, Bytes> &info_and_data :
          readings) {
       const le_advertising_info &info = info_and_data.first;
       const Bytes &data = info_and_data.second;
 
-      printf("%s - RSSI %4d ", bt_address.c_str(), (char)data[info.length]);
+      char addr[18]{};
+      ba2str(&(info.bdaddr), addr);
+      printf("%s - RSSI %4d ", addr, (char)data[info.length]);
       for (const auto &byte : data) {
         printf("%02X", byte);
       }
@@ -93,7 +100,7 @@ public:
         hci_open_dev(device_id < 0 ? hci_get_route(NULL) : device_id);
     if (device < 0) {
       perror("Failed to open HCI device.");
-      return 0;
+      exit(-1);
     }
     return BLESensorScanner(device);
   }
@@ -147,9 +154,7 @@ public:
         uint8_t *offset = meta_event->data + 1;
         while (reports_count--) {
           le_advertising_info &info = *((le_advertising_info *)offset);
-          string addr(18, '\0');
-          ba2str(&(info.bdaddr), const_cast<char *>(addr.data()));
-          readings[addr].AddReading(info, info.data);
+          readings[info.bdaddr].AddReading(info, info.data);
           offset += EVT_LE_META_EVENT_SIZE + LE_ADVERTISING_INFO_SIZE +
                     info.length +
                     1 /* final RSSI byte in EVT_LE_ADVERTISING_REPORT */;
@@ -160,8 +165,8 @@ public:
 
   // Prints all received readings and flushes the printed readings.
   void PrintAndFlushReadings() {
-    for (std::pair<const string, SensorReadings> &keyed_reading : readings) {
-      keyed_reading.second.PrintAndFlush(keyed_reading.first);
+    for (std::pair<const bdaddr_t, SensorReadings> &keyed_reading : readings) {
+      keyed_reading.second.PrintAndFlush();
     }
   }
 
@@ -187,7 +192,7 @@ private:
   }
 
   const int device; // The device id.
-  std::map<string, SensorReadings>
+  std::map<bdaddr_t, SensorReadings>
       readings; // Readings keyed by sender BT address.
 };
 
