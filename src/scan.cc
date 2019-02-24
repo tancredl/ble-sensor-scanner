@@ -89,13 +89,14 @@ public:
 
 private:
   float read_value(const Bytes &data, int offset, float steps_per_unit) {
-    return le16toh(*reinterpret_cast<const unsigned short *>(&data[offset])) /
+    return static_cast<short>(le16toh(
+               *reinterpret_cast<const unsigned short *>(&data[offset]))) /
            steps_per_unit;
   }
 
   // Readings as pairs of advertising info and user bytes.
   std::vector<std::pair<le_advertising_info, Bytes>> readings;
-  // TODO(tancred): Implement this.
+  // The sensor readings are "muted" (do not print) until this timestamp.
   double mute_until = 0.0;
 };
 
@@ -215,8 +216,8 @@ private:
   }
 
   const int device; // The device id.
-  std::map<bdaddr_t, SensorReadings>
-      readings; // Readings keyed by sender BT address.
+  // Readings keyed by sender BT address.
+  std::map<bdaddr_t, SensorReadings> readings;
 };
 
 } // namespace
